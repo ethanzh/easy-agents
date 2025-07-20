@@ -1,10 +1,11 @@
 from fastapi import FastAPI
-from agent import Agent
+from agent import Agent, ClaudeCodeProvider, OpenAIProvider, create_claude_agent, create_openai_agent
 import asyncio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from contextlib import asynccontextmanager
 from utils.cron import cron, cron_jobs
+import os
 
 
 # This is a FastAPI lifecycle manager that starts the cron job scheduler when the app starts
@@ -25,6 +26,42 @@ app = FastAPI(lifespan=lifespan)  # for webhook triggers
 scheduler = AsyncIOScheduler()  # for cron job triggers
 
 
+# Helper function to create agents with the configured AI provider
+def create_agent_with_provider(
+    name: str,
+    description: str,
+    system_prompt: str,
+    prompt: str,
+    mcp_servers: list[str],
+    allowed_tools: list[str] = None,
+):
+    """
+    Create an agent using the AI provider specified in the AI_PROVIDER environment variable.
+    Defaults to Claude Code if not specified.
+    """
+    provider_type = os.getenv("AI_PROVIDER", "claude").lower()
+    
+    if provider_type == "openai":
+        return create_openai_agent(
+            name=name,
+            description=description,
+            system_prompt=system_prompt,
+            prompt=prompt,
+            mcp_servers=mcp_servers,
+            allowed_tools=allowed_tools,
+            model=os.getenv("OPENAI_MODEL", "gpt-4o")
+        )
+    else:
+        return create_claude_agent(
+            name=name,
+            description=description,
+            system_prompt=system_prompt,
+            prompt=prompt,
+            mcp_servers=mcp_servers,
+            allowed_tools=allowed_tools,
+        )
+
+
 @app.get("/security-alert-agent/{alert_id}")
 async def security_alert_agent(alert_id: str):
     system_prompt = """
@@ -41,13 +78,32 @@ async def security_alert_agent(alert_id: str):
     - The report should include alert title, severity, event timelime, any notable details, and whether you think the alert is malicious or benign. 
     """
 
-    agent = Agent(
+    # Method 1: Using the helper function (recommended)
+    agent = create_agent_with_provider(
         name="security-alert-agent",
         description="Agent for handling security alerts from our SIEM",
         system_prompt=system_prompt,
         prompt=f"security alert ID: {alert_id}",
         mcp_servers=["panther", "virustotal", "slack"],
     )
+
+    # Method 2: Using specific provider directly
+    # agent = create_claude_agent(
+    #     name="security-alert-agent",
+    #     description="Agent for handling security alerts from our SIEM",
+    #     system_prompt=system_prompt,
+    #     prompt=f"security alert ID: {alert_id}",
+    #     mcp_servers=["panther", "virustotal", "slack"],
+    # )
+    
+    # Method 3: Using OpenAI (note: MCP servers won't work with OpenAI in this implementation)
+    # agent = create_openai_agent(
+    #     name="security-alert-agent",
+    #     description="Agent for handling security alerts from our SIEM",
+    #     system_prompt=system_prompt,
+    #     prompt=f"security alert ID: {alert_id}",
+    #     mcp_servers=[],  # OpenAI doesn't support MCP servers in this implementation
+    # )
 
     asyncio.create_task(agent.run())
     return {"status": "task started"}
@@ -73,7 +129,8 @@ async def code_scanning_alert_agent(repo_owner: str, repo_name: str, alert_id: s
     - Ensure you pull latest from main branch before making any code changes.
     - Add "Created with Claude Code Security Agent 🤖. Any issues or questions please contact Kyle" to the PR description and any comments.
     """
-    agent = Agent(
+    
+    agent = create_agent_with_provider(
         name="code-scanning-alert-agent",
         description="Agent for handling code-scanning security alerts and creating fix PRs",
         system_prompt=system_prompt,
@@ -106,12 +163,35 @@ async def dependabot_alert_agent(repo_owner: str, repo_name: str, alert_id: str)
     - Add "Created with Claude Code Security Agent 🤖. Any issues or questions please contact Kyle" to the PR description and any comments.
     """
 
-    agent = Agent(
+    agent = create_agent_with_provider(
         name="dependabot-alert-agent",
         description="Agent for handling dependabot security alerts and updating package versions",
         system_prompt=system_prompt,
         prompt=f"dependabot alert ID: {alert_id} repo: {repo_owner}/{repo_name}",
         mcp_servers=["github", "github_extended"],
+    )
+
+    asyncio.create_task(agent.run())
+    return {"status": "task started"}
+
+@app.get("/test-endpoint")
+async def test_endpoint():
+    system_prompt = """
+    You are a security agent that is responsible for reading the Security Platform team backlog in linear.
+    
+    High level steps to accomplish your task:
+    - Look at all the items on the Security Platform team backlog in linear
+
+    Things to remember:
+    - This should be easy
+    """
+
+    agent = create_agent_with_provider(
+        name="secplat-backlog-agent",
+        description="Agent for reading the Security Platform team backlog in linear",
+        system_prompt=system_prompt,
+        prompt=f"",
+        mcp_servers=["linear"],
     )
 
     asyncio.create_task(agent.run())
@@ -129,12 +209,14 @@ async def weekly_update_agent(team_name: str = "SEC"):
     3. Send the summary to the slack channel #updates (channel ID: CXXXXXX)
     
     """
-    agent = Agent(
+    
+    agent = create_agent_with_provider(
         name=f"weekly-update-agent-{team_name}",
         description="Agent for summarizing what the team got done this week",
         system_prompt=system_prompt,
         prompt=f"team: {team_name}",
         mcp_servers=["linear", "slack"],
     )
+    
     asyncio.create_task(agent.run())
     return {"status": "task started"}

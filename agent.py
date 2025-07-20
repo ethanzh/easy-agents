@@ -1,5 +1,5 @@
-from claude_code_sdk import query, ClaudeCodeOptions, Message
-from typing import Optional
+from abc import ABC, abstractmethod
+from typing import Optional, List, Dict, Any, AsyncGenerator
 import os
 from dotenv import load_dotenv
 
@@ -73,6 +73,117 @@ mcp_config = {
 }
 
 
+class Message:
+    """Generic message class for AI provider responses"""
+    def __init__(self, content: str, role: str = "assistant", **kwargs):
+        self.content = content
+        self.role = role
+        self.metadata = kwargs
+
+    def __str__(self):
+        return f"{self.role}: {self.content}"
+
+
+class AIProvider(ABC):
+    """Abstract base class for AI providers"""
+    
+    @abstractmethod
+    async def query(
+        self, 
+        prompt: str, 
+        system_prompt: str,
+        mcp_servers: Dict[str, Dict],
+        allowed_tools: Optional[List[str]] = None
+    ) -> AsyncGenerator[Message, None]:
+        """Query the AI provider with the given prompt and configuration"""
+        pass
+
+
+class ClaudeCodeProvider(AIProvider):
+    """Claude Code AI provider implementation"""
+    
+    def __init__(self):
+        try:
+            from claude_code_sdk import query as claude_query, ClaudeCodeOptions
+            self.claude_query = claude_query
+            self.ClaudeCodeOptions = ClaudeCodeOptions
+        except ImportError:
+            raise ImportError("claude-code-sdk is required for ClaudeCodeProvider. Install with: pip install claude-code-sdk")
+
+    async def query(
+        self, 
+        prompt: str, 
+        system_prompt: str,
+        mcp_servers: Dict[str, Dict],
+        allowed_tools: Optional[List[str]] = None
+    ) -> AsyncGenerator[Message, None]:
+        options = self.ClaudeCodeOptions(
+            permission_mode="bypassPermissions",
+            mcp_servers=mcp_servers,
+            mcp_tools=allowed_tools,
+            system_prompt=system_prompt,
+        )
+        
+        async for message in self.claude_query(prompt=prompt, options=options):
+            # Convert Claude Code message to our generic Message format
+            yield Message(
+                content=str(message),
+                role="assistant",
+                original_message=message
+            )
+
+
+class OpenAIProvider(AIProvider):
+    """OpenAI AI provider implementation"""
+    
+    def __init__(self, api_key: Optional[str] = None, model: str = "gpt-4o"):
+        try:
+            import openai
+            self.client = openai.AsyncOpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
+            self.model = model
+        except ImportError:
+            raise ImportError("openai is required for OpenAIProvider. Install with: pip install openai")
+        
+        if not self.client.api_key:
+            raise ValueError("OpenAI API key is required. Set OPENAI_API_KEY environment variable or pass api_key parameter.")
+
+    async def query(
+        self, 
+        prompt: str, 
+        system_prompt: str,
+        mcp_servers: Dict[str, Dict],
+        allowed_tools: Optional[List[str]] = None
+    ) -> AsyncGenerator[Message, None]:
+        # Note: OpenAI doesn't support MCP servers directly like Claude Code
+        # This is a simplified implementation that ignores MCP servers
+        # For full MCP support with OpenAI, you'd need additional tool calling logic
+        
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt}
+        ]
+        
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                stream=True
+            )
+            
+            async for chunk in response:
+                if chunk.choices[0].delta.content:
+                    yield Message(
+                        content=chunk.choices[0].delta.content,
+                        role="assistant"
+                    )
+        except Exception as e:
+            yield Message(
+                content=f"Error querying OpenAI: {str(e)}",
+                role="assistant",
+                error=True
+            )
+
+
 class Agent:
     def __init__(
         self,
@@ -80,31 +191,75 @@ class Agent:
         description: str,
         system_prompt: str,
         prompt: str,
-        mcp_servers: list[str],
-        allowed_tools: Optional[list[str]] = None,
+        mcp_servers: List[str],
+        allowed_tools: Optional[List[str]] = None,
+        ai_provider: Optional[AIProvider] = None,
     ):
         self.name = name
         self.description = description
         self.system_prompt = system_prompt
         self.prompt = prompt
-        self.mcp_servers: dict[str, dict] = {
+        self.mcp_servers: Dict[str, Dict] = {
             server: mcp_config["mcpServers"][server]
             for server in mcp_servers
             if server in mcp_config["mcpServers"]
         }
-        self.allowed_tools: Optional[list[str]] = allowed_tools
-        self._claude_code_options = ClaudeCodeOptions(
-            permission_mode="bypassPermissions",
-            mcp_servers=self.mcp_servers,
-            mcp_tools=self.allowed_tools,
-            system_prompt=self.system_prompt,
-        )
+        self.allowed_tools: Optional[List[str]] = allowed_tools
+        
+        # Use provided AI provider or default to Claude Code
+        self.ai_provider = ai_provider or ClaudeCodeProvider()
 
-    async def run(self) -> list[Message]:
+    async def run(self) -> List[Message]:
         messages = []
-        async for message in query(
-            prompt=self.prompt, options=self._claude_code_options
+        async for message in self.ai_provider.query(
+            prompt=self.prompt,
+            system_prompt=self.system_prompt,
+            mcp_servers=self.mcp_servers,
+            allowed_tools=self.allowed_tools
         ):
             print(message)
             messages.append(message)
         return messages
+
+
+# Convenience functions for creating agents with different providers
+def create_claude_agent(
+    name: str,
+    description: str,
+    system_prompt: str,
+    prompt: str,
+    mcp_servers: List[str],
+    allowed_tools: Optional[List[str]] = None,
+) -> Agent:
+    """Create an agent using Claude Code as the AI provider"""
+    return Agent(
+        name=name,
+        description=description,
+        system_prompt=system_prompt,
+        prompt=prompt,
+        mcp_servers=mcp_servers,
+        allowed_tools=allowed_tools,
+        ai_provider=ClaudeCodeProvider()
+    )
+
+
+def create_openai_agent(
+    name: str,
+    description: str,
+    system_prompt: str,
+    prompt: str,
+    mcp_servers: List[str],
+    allowed_tools: Optional[List[str]] = None,
+    api_key: Optional[str] = None,
+    model: str = "gpt-4o"
+) -> Agent:
+    """Create an agent using OpenAI as the AI provider"""
+    return Agent(
+        name=name,
+        description=description,
+        system_prompt=system_prompt,
+        prompt=prompt,
+        mcp_servers=mcp_servers,
+        allowed_tools=allowed_tools,
+        ai_provider=OpenAIProvider(api_key=api_key, model=model)
+    )
